@@ -61,6 +61,9 @@ async def collect_wordpress_posts(domains_file, hours_ago, debug_mode=False):
     timestamp_dir = os.path.join(date_dir, timestamp_str)
     os.makedirs(timestamp_dir)
 
+    # Track sites that need additional testing
+    sites_needing_testing = []
+
     summary = {
         "collection_timestamp": timestamp_str,
         "collection_date": date_str,
@@ -70,7 +73,7 @@ async def collect_wordpress_posts(domains_file, hours_ago, debug_mode=False):
 
     try:
         with open(domains_file, 'r') as f:
-            domains = [line.strip() for line in f if line.strip()]
+            domains = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
     except FileNotFoundError:
         print(f"Error: '{domains_file}' not found.")
         return
@@ -203,8 +206,97 @@ async def collect_wordpress_posts(domains_file, hours_ago, debug_mode=False):
             result["status"] = "success"
         elif not result.get("error_message"):
             result["error_message"] = "No articles found in timeframe"
+            # Track sites that need testing
+            sites_needing_testing.append(domain)
 
         summary["results"].append(result)
+
+    # Test sites that didn't return articles with unfiltered requests
+    site_notes = {}
+    if sites_needing_testing:
+        print(f"\n🔍 Testing {len(sites_needing_testing)} sites with unfiltered JSON requests...")
+
+        # Build unfiltered URLs (no date filter, just get latest posts)
+        test_urls = []
+        test_metadata = []
+        for domain in sites_needing_testing:
+            base_url = f"https://{domain.strip()}"
+            posts_url = f"{base_url}/wp-json/wp/v2/posts"
+            params = {
+                'page': 1,
+                'per_page': 10,  # Just get a few to test
+                'orderby': 'date',
+                'order': 'desc'
+            }
+            query_string = urllib.parse.urlencode(params)
+            url = f"{posts_url}?{query_string}"
+            test_urls.append(url)
+            test_metadata.append((url, domain))
+
+        # Track test results
+        test_results = {}
+
+        def on_test_success(url, data, index):
+            """Callback for test fetch success"""
+            domain = test_metadata[index][1]
+            article_count = len(data) if isinstance(data, list) else 0
+            test_results[domain] = {
+                "has_json_api": True,
+                "articles_found": article_count,
+                "note": f"Site has JSON API but returned no articles in the {hours_ago}h timeframe"
+            }
+            print(f"  ✓ {domain}: Found {article_count} articles with unfiltered request")
+
+        def on_test_error(url, error, content, index):
+            """Callback for test fetch error"""
+            domain = test_metadata[index][1]
+            test_results[domain] = {
+                "has_json_api": False,
+                "articles_found": 0,
+                "error": error,
+                "note": "Site does not provide JSON API or has access restrictions"
+            }
+            print(f"  ✗ {domain}: No JSON API available - {error}")
+
+        # Use context manager for browser lifecycle
+        async with NodriverBrowser() as browser:
+            await fetch_json_from_urls(
+                browser,
+                test_urls,
+                wait_time=3.0,
+                selector='body',
+                selector_timeout=10.0,
+                delay_range=(0, 1),
+                debug_dir="debug_pages",
+                on_success=on_test_success,
+                on_error=on_test_error,
+                progress_desc="Testing WordPress JSON APIs",
+                debug_mode=debug_mode
+            )
+
+        # Build site notes
+        for domain in sites_needing_testing:
+            if domain in test_results:
+                site_notes[domain] = test_results[domain]
+            else:
+                site_notes[domain] = {
+                    "has_json_api": None,
+                    "articles_found": 0,
+                    "note": "Test was not completed"
+                }
+
+    # Write site notes file if we have any
+    if site_notes:
+        notes_filepath = os.path.join(timestamp_dir, "wordpress-site-notes.json")
+        with open(notes_filepath, 'w') as f:
+            json.dump(site_notes, f, indent=2)
+        print(f"\n📝 Site diagnostics written to {notes_filepath}")
+
+        # Summary statistics
+        has_api = sum(1 for note in site_notes.values() if note.get("has_json_api") == True)
+        no_api = sum(1 for note in site_notes.values() if note.get("has_json_api") == False)
+        print(f"   - {has_api} sites have JSON API (may need different time range)")
+        print(f"   - {no_api} sites have no JSON API (need alternative scraping)")
 
     # Write summary file
     summary_filepath = os.path.join(timestamp_dir, "_collection_summary.json")
