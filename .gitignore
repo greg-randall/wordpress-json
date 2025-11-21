@@ -1,0 +1,8 @@
+*.7z
+.claude/*
+*.txt
+old/*
+*.json
+wordpress_posts/*
+__pycache__/*
+debug*
